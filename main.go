@@ -6,16 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
-
-	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
 const (
@@ -73,20 +71,39 @@ func process(job Job) Result {
 	}
 	defer os.Remove(tmpInput)
 
+	cmd := exec.CommandContext(
+		job.ctx,
+		"ffmpeg",
+		"-y", // overwrite output if exists
+		"-loglevel", "error",
+		"-i", tmpInput,
+		"-ac", "1",
+		"-ar", fmt.Sprintf("%d", SampleRate),
+		"-sample_fmt", "s16",
+		"-f", "wav",
+		tmpOutput,
+	)
+
 	var stderr bytes.Buffer
-
-	err = ffmpeg.Input(tmpInput).
-		Output(tmpOutput, ffmpeg.KwArgs{
-			"ac":         1,
-			"ar":         SampleRate,
-			"sample_fmt": "s16",
-			"f":          "wav",
-		}).
-		WithErrorOutput(&stderr).
-		Run()
-
+	cmd.Stderr = &stderr
+	err = cmd.Run()
 	if err != nil {
-		return Result{Err: fmt.Errorf("ffmpeg: %s", stderr.String())}
+		// If context cancelled, surface that clearly
+		if job.ctx.Err() == context.DeadlineExceeded {
+			return Result{Err: fmt.Errorf("ffmpeg timed out")}
+		}
+		if job.ctx.Err() == context.Canceled {
+			return Result{Err: fmt.Errorf("request cancelled")}
+		}
+		return Result{Err: fmt.Errorf("ffmpeg failed: %s", stderr.String())}
+	}
+
+	info, err := os.Stat(tmpOutput)
+	if err != nil {
+		return Result{Err: err}
+	}
+	if info.Size() == 0 {
+		return Result{Err: fmt.Errorf("ffmpeg produced empty output")}
 	}
 
 	file, _ := os.Open(tmpOutput)
@@ -103,7 +120,8 @@ func process(job Job) Result {
 
 func normalizeHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
 
 	if err := r.ParseMultipartForm(MaxUploadSize); err != nil {
 		httpError(w, 400, "INVALID_FORM", err.Error())
@@ -145,17 +163,7 @@ func normalizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpPath := outPath + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			respond(w, hash, header.Filename, outPath, true, start)
-			return
-		}
-		httpError(w, 500, "FS_ERROR", err.Error())
-		return
-	}
-	f.Close()
+	tmpPath := fmt.Sprintf("%s.tmp", outPath)
 
 	job := Job{
 		ctx:     ctx,
@@ -175,7 +183,12 @@ func normalizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	os.Rename(tmpPath, outPath)
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		os.Remove(tmpPath)
+		httpError(w, 500, "FS_ERROR", err.Error())
+		return
+	}
+
 	respond(w, hash, header.Filename, outPath, false, start)
 }
 
